@@ -1,4 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from typing import Annotated
+
+import psycopg
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from db import get_connection
@@ -255,3 +258,75 @@ def assign_rider(order_id: int) -> Assignment:
         distance_km=round(distance_km, 2),
         eta_minutes=estimate_eta_minutes(distance_km),
     )
+
+
+
+# ---------- Payments ----------
+# The purpose is avoid any error
+class PaymentCreate(BaseModel):
+    amount_cents: int = Field(gt=0, le=1_000_000)
+
+
+class Payment(BaseModel):
+    """A payment stored in our system."""
+    id: int
+    order_id: int
+    amount_cents: int
+    idempotency_key: str
+
+
+PAYMENT_COLUMNS = "id, order_id, amount_cents, idempotency_key"
+
+
+@app.post("/orders/{order_id}/payments", status_code=201)
+def pay_for_order(
+    order_id: int,
+    payment: PaymentCreate,
+    response: Response,
+    idempotency_key: Annotated[str, Header(min_length=8, max_length=100)],
+) -> Payment:
+    """Charge an order exactly once, even if the same request arrives many times."""
+    with get_connection() as conn:
+        # 1. Lock the order. Identical requests now wait in line, one at a time.
+        order_row = conn.execute(
+            "SELECT status FROM orders WHERE id = %s FOR UPDATE", (order_id,)
+        ).fetchone()
+        if order_row is None:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # 2. Seen this key before? Then it's a retry: return the SAME payment, charge nothing.
+        existing = conn.execute(
+            f"SELECT {PAYMENT_COLUMNS} FROM payments WHERE idempotency_key = %s",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            if existing["order_id"] != order_id or existing["amount_cents"] != payment.amount_cents:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This Idempotency-Key was already used for a different payment",
+                )
+            response.status_code = 200  # replay: nothing new was created
+            return Payment(**existing)
+
+        # 3. Business rules
+        if OrderStatus(order_row["status"]) == OrderStatus.CANCELLED:
+            raise HTTPException(status_code=409, detail="Cannot pay for a cancelled order")
+        already_paid = conn.execute(
+            "SELECT 1 FROM payments WHERE order_id = %s", (order_id,)
+        ).fetchone()
+        if already_paid is not None:
+            raise HTTPException(status_code=409, detail="Order is already paid")
+
+        # 4. Charge it (the UNIQUE rules in the database are the last safety net)
+        try:
+            row = conn.execute(
+                "INSERT INTO payments (order_id, amount_cents, idempotency_key) "
+                f"VALUES (%s, %s, %s) RETURNING {PAYMENT_COLUMNS}",
+                (order_id, payment.amount_cents, idempotency_key),
+            ).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(
+                status_code=409,
+                detail="This Idempotency-Key was already used for a different payment",
+            ) from None
+    return Payment(**row)

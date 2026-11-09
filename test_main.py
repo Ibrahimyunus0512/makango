@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from dotenv import load_dotenv
@@ -21,7 +22,7 @@ def reset_database():
     """Before each test: empty both tables and add the same 3 riders."""
     assert "test" in os.environ["DATABASE_URL"], "Refusing to wipe a non-test database!"
     with get_connection() as conn:
-        conn.execute("TRUNCATE orders, riders RESTART IDENTITY")
+        conn.execute("TRUNCATE payments, orders, riders RESTART IDENTITY")
         conn.execute(
             "INSERT INTO riders (name, is_available, latitude, longitude) VALUES "
             "('Ali', true, 3.1579, 101.7116), "    # KLCC, about 7.3 km away (too far)
@@ -184,3 +185,81 @@ def test_delivering_an_order_frees_the_rider():
     client.patch(f"/orders/{order_id}/status", json={"status": "PICKED_UP"})
     client.patch(f"/orders/{order_id}/status", json={"status": "DELIVERED"})
     assert client.get("/riders/2").json()["is_available"] is True
+
+# ---------- Payments ----------
+
+def pay(order_id: int, amount_cents: int, key: str):
+    """Helper: send a payment with an Idempotency-Key header."""
+    return client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": amount_cents},
+        headers={"Idempotency-Key": key},
+    )
+
+
+def count_payments() -> int:
+    """Helper: how many payments are really stored in the database."""
+    with get_connection() as conn:
+        return conn.execute("SELECT COUNT(*) AS n FROM payments").fetchone()["n"]
+
+
+def test_first_payment_returns_201():
+    order_id = place_order()
+    response = pay(order_id, 1250, "key-abc-001")
+    assert response.status_code == 201
+    assert response.json()["amount_cents"] == 1250
+
+
+def test_same_key_sent_twice_charges_only_once():
+    order_id = place_order()
+    first = pay(order_id, 1250, "key-abc-001")
+    second = pay(order_id, 1250, "key-abc-001")  # the app retried after a network glitch
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json() == first.json()          # same payment returned
+    assert count_payments() == 1                   # customer charged ONCE
+
+
+def test_ten_identical_requests_at_the_same_time_charge_only_once():
+    order_id = place_order()
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        responses = list(pool.map(lambda _: pay(order_id, 1250, "key-abc-001"), range(10)))
+    codes = sorted(r.status_code for r in responses)
+    assert codes == [200] * 9 + [201]
+    assert count_payments() == 1
+
+
+def test_same_key_with_different_amount_returns_409():
+    order_id = place_order()
+    pay(order_id, 1250, "key-abc-001")
+    response = pay(order_id, 9999, "key-abc-001")
+    assert response.status_code == 409
+
+
+def test_paying_an_already_paid_order_with_new_key_returns_409():
+    order_id = place_order()
+    pay(order_id, 1250, "key-abc-001")
+    response = pay(order_id, 1250, "key-xyz-002")
+    assert response.status_code == 409
+    assert count_payments() == 1
+
+
+def test_payment_without_idempotency_key_returns_422():
+    order_id = place_order()
+    response = client.post(f"/orders/{order_id}/payments", json={"amount_cents": 1250})
+    assert response.status_code == 422
+
+
+def test_zero_amount_returns_422():
+    order_id = place_order()
+    assert pay(order_id, 0, "key-abc-001").status_code == 422
+
+
+def test_payment_for_unknown_order_returns_404():
+    assert pay(999, 1250, "key-abc-001").status_code == 404
+
+
+def test_cannot_pay_for_cancelled_order():
+    order_id = place_order()
+    client.patch(f"/orders/{order_id}/status", json={"status": "CANCELLED"})
+    assert pay(order_id, 1250, "key-abc-001").status_code == 409
